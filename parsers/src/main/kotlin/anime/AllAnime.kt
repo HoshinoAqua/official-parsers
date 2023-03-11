@@ -1,10 +1,9 @@
-package parsers.anime
+package anime
 
 import ani.saikou.*
 import ani.saikou.parsers.*
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import parsers.anime.extractors.FPlayer
 import parsers.anime.extractors.GogoCDN
@@ -17,25 +16,23 @@ class AllAnime : AnimeParser() {
     override val hostUrl = "https://allanime.to"
     override val isDubAvailableSeparately = true
 
-    private val apiHost = "https://api.allanime.co/"
+    private val apiHost = "https://api.allanime.co"
     private val ytAnimeCoversHost = "https://wp.youtube-anime.com/aln.youtube-anime.com"
     private val idRegex = Regex("${hostUrl}/anime/(\\w+)")
     private val epNumRegex = Regex("/[sd]ub/(\\d+)")
 
 
-    private val idHash = "f73a8347df0e3e794f8955a18de6e85ac25dfc6b74af8ad613edf87bb446a854"
+    private val idHash = "259ae45c19ceff2f855215bb82d377fe7b0ab661f9abcd41538bda935e9cb299"
     private val episodeInfoHash = "73d998d209d6d8de325db91ed8f65716dce2a1c5f4df7d304d952fa3f223c9e8"
-    private val searchHash = "9c7a8bc1e095a34f2972699e8105f7aaf9082c6e1ccd56eab99c2f1a971152c6"
-    private val videoServerHash = "1f0a5d6c9ce6cd3127ee4efd304349345b0737fbf5ec33a60bbc3d18e3bb7c61"
+    private val searchHash = "c4305f3918591071dfecd081da12243725364f6b7dd92072df09d915e390b1b7"
+    private val videoServerHash = "919e327075ac9e249d003aa3f804a48bbdf22d7b1d107ffe659accd54283ce48"
 
     override suspend fun loadEpisodes(animeLink: String, extra: Map<String, String>?): List<Episode> {
-        val responseArray = mutableListOf<Episode>()
-
         val showId = idRegex.find(animeLink)?.groupValues?.get(1)
         if (showId != null) {
             val episodeInfos = getEpisodeInfos(showId)
             val format = DecimalFormat("#####.#####")
-            episodeInfos?.sortedBy { it.episodeIdNum }?.forEach { epInfo ->
+            return episodeInfos?.sortedBy { it.episodeIdNum }?.map { epInfo ->
                 val link = """${hostUrl}/anime/$showId/episodes/${if (selectDub) "dub" else "sub"}/${epInfo.episodeIdNum}"""
                 val epNum = format.format(epInfo.episodeIdNum).toString()
                 val thumbnail = epInfo.thumbnails?.let {
@@ -50,10 +47,13 @@ class AllAnime : AnimeParser() {
                         null
                     }
                 }
-                responseArray.add(Episode(epNum, link = link, epInfo.notes, thumbnail))
-            }
+                val title = epInfo.notes?.substringBefore("<note-split>")
+                var desc = epInfo.notes?.substringAfter("<note-split>","")
+                desc = if(desc?.isEmpty() == true) null else desc
+                Episode(epNum, link = link, title, thumbnail, desc)
+            } ?: emptyList()
         }
-        return responseArray
+        return emptyList()
     }
 
     override suspend fun loadVideoServers(episodeLink: String, extra: Map<String, String>?): List<VideoServer> {
@@ -77,7 +77,7 @@ class AllAnime : AnimeParser() {
                 }
 
                 if (source.sourceUrl.toHttpUrlOrNull() == null) {
-                    val jsonUrl = """${apiHost}${source.sourceUrl.replace("clock", "clock.json").substring(1)}"""
+                    val jsonUrl = """https://allanimenews.com/${source.sourceUrl.replace("clock", "clock.json").substring(1)}"""
                     videoServers.add(VideoServer(serverName, jsonUrl, mapOf("type" to source.type)))
                 } else {
                     videoServers.add(VideoServer(serverName, source.sourceUrl, mapOf("type" to source.type)))
@@ -107,9 +107,56 @@ class AllAnime : AnimeParser() {
         return extractor
     }
 
+    override suspend fun search(query: String): List<ShowResponse> {
+        val variables =
+            """{"search":{"allowAdult":${adult},"query":"$query"},"translationType":"${if (selectDub) "dub" else "sub"}"}"""
+        return graphqlQuery(variables, searchHash).data?.shows?.edges?.map { show ->
+            val link = """${hostUrl}/anime/${show.id}"""
+            val otherNames = mutableListOf<String>()
+            show.englishName?.let { otherNames.add(it) }
+            show.nativeName?.let { otherNames.add(it) }
+            show.altNames?.forEach { otherNames.add(it) }
+
+            ShowResponse(
+                show.name,
+                link,
+                show.thumbnail?: "https://s4.anilist.co/file/anilistcdn/media/manga/cover/medium/default.jpg",
+                otherNames,
+                show.availableEpisodes.let { if (selectDub) it.dub else it.sub }
+            )
+        } ?: emptyList()
+    }
+
+    private suspend fun graphqlQuery(variables: String, persistHash: String): Query {
+        val extensions = """{"persistedQuery":{"version":1,"sha256Hash":"$persistHash"}}"""
+        val res = client.get(
+            "$apiHost/allanimeapi",
+            params = mapOf(
+                "variables" to variables,
+                "extensions" to extensions
+            )
+        ).parsed<Query>()
+        if(res.data==null) throw Exception(res.errors!![0].message)
+        return res
+    }
+
+    private suspend fun getEpisodeInfos(showId: String): List<EpisodeInfo>? {
+        val variables = """{"_id": "$showId"}"""
+        val show = graphqlQuery(variables, idHash).data?.show
+        if (show != null) {
+            val epCount = if (selectDub) show.availableEpisodes.dub else show.availableEpisodes.sub
+            val epVariables = """{"showId":"$showId","episodeNumStart":0,"episodeNumEnd":${epCount}}"""
+            return graphqlQuery(
+                epVariables,
+                episodeInfoHash
+            ).data?.episodeInfos
+        }
+        return null
+    }
+
     private class AllAnimeExtractor(override val server: VideoServer, val direct: Boolean = false) : VideoExtractor() {
         override suspend fun extract(): VideoContainer {
-            val url = "https://allanimenews.com/apivtwo${server.embed.url.substringAfter("apivtwo")}"
+            val url = server.embed.url
             return if (direct)
                 VideoContainer(listOf(Video(null, VideoType.CONTAINER, url, getSize(url))))
             else {
@@ -125,10 +172,10 @@ class AllAnime : AnimeParser() {
                             i.portData?.streams?.mapNotNull {
                                 when {
                                     it.format == "adaptive_dash" && it.hardsubLang == "en-US"
-                                         ->
+                                    ->
                                         Video(null, VideoType.DASH, it.url ?: return@mapNotNull null, null, "DASH")
                                     it.format == "adaptive_hls" && it.hardsubLang == "en-US"
-                                         ->
+                                    ->
                                         Video(null, VideoType.M3U8, it.url ?: return@mapNotNull null, null, "M3U8")
                                     else -> null
                                 }
@@ -151,78 +198,16 @@ class AllAnime : AnimeParser() {
         }
     }
 
-    override suspend fun search(query: String): List<ShowResponse> {
-        val responseArray = arrayListOf<ShowResponse>()
-
-        val variables =
-            """{"search":{"allowAdult":${adult},"query":"$query"},"translationType":"${if (selectDub) "dub" else "sub"}"}"""
-        val edges =
-            graphqlQuery(variables, searchHash).data?.shows?.edges
-        if (!edges.isNullOrEmpty()) {
-            for (show in edges) {
-                val link = """${hostUrl}/anime/${show.id}"""
-                val otherNames = mutableListOf<String>()
-                show.englishName?.let { otherNames.add(it) }
-                show.nativeName?.let { otherNames.add(it) }
-                show.altNames?.forEach { otherNames.add(it) }
-                if (show.thumbnail == null) {
-                    snackString(""""Could not get thumbnail for ${show.id}""")
-                    continue
-                }
-                responseArray.add(
-                    ShowResponse(
-                        show.name,
-                        link,
-                        show.thumbnail,
-                        otherNames,
-                        show.availableEpisodes.let { if (selectDub) it.dub else it.sub })
-                )
-            }
-
-        }
-
-        return responseArray
-    }
-
-    private suspend fun graphqlQuery(variables: String, persistHash: String): Query {
-        val extensions = """{"persistedQuery":{"version":1,"sha256Hash":"$persistHash"}}"""
-        val graphqlUrl = ("$hostUrl/allanimeapi").toHttpUrl().newBuilder()
-            .addQueryParameter("variables", variables)
-            .addQueryParameter("extensions", extensions)
-            .build().toString()
-        return client.get(
-            graphqlUrl,
-            mapOf("Host" to hostUrl.toHttpUrl().host)
-        ).parsed()
-    }
-
-    private suspend fun getEpisodeInfos(showId: String): List<EpisodeInfo>? {
-        val variables = """{"_id": "$showId"}"""
-        val show = graphqlQuery(variables, idHash).data?.show
-        if (show != null) {
-            val epCount = if (selectDub) show.availableEpisodes.dub else show.availableEpisodes.sub
-            val epVariables = """{"showId":"$showId","episodeNumStart":0,"episodeNumEnd":${epCount}}"""
-            return graphqlQuery(
-                epVariables,
-                episodeInfoHash
-            ).data?.episodeInfos
-        }
-        return null
-    }
-
-    override suspend fun loadSavedShowResponse(mediaId: Int): ShowResponse? {
-        return loadData("${saveName}_$mediaId")
-    }
-
-    override fun saveShowResponse(mediaId: Int, response: ShowResponse?, selected: Boolean) {
-        if (response != null) {
-            setUserText("${if (selected) "Selected" else "Found"} : ${response.name}")
-            saveData("${saveName}_$mediaId", response)
-        }
-    }
-
     @Serializable
-    private data class Query(@SerialName("data") var data: Data?) {
+    private data class Query(
+        @SerialName("data") var data: Data?,
+        var errors : List<Error>?
+    ) {
+
+        @Serializable
+        data class Error(
+            var message: String
+        )
 
         @Serializable
         data class Data(
@@ -326,5 +311,3 @@ class AllAnime : AnimeParser() {
         )
     }
 }
-
-

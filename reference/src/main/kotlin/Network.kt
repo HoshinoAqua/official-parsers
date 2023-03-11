@@ -30,7 +30,7 @@ val defaultHeaders = mapOf(
 lateinit var okHttpClient: OkHttpClient
 lateinit var client: Requests
 
-fun initializeNetwork(dns:Int) {
+fun initializeNetwork(dns:Int=0) {
 
     okHttpClient = OkHttpClient.Builder()
         .followRedirects(true)
